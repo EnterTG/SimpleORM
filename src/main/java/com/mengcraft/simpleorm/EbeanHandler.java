@@ -2,6 +2,7 @@ package com.mengcraft.simpleorm;
 
 import com.avaje.ebean.EbeanServer;
 import com.avaje.ebean.EbeanServerFactory;
+import com.avaje.ebean.LogLevel;
 import com.avaje.ebean.Query;
 import com.avaje.ebean.config.ServerConfig;
 import com.avaje.ebean.config.dbplatform.SQLitePlatform;
@@ -10,7 +11,9 @@ import com.avaje.ebeaninternal.server.core.DefaultServer;
 import com.avaje.ebeaninternal.server.ddl.DdlGenerator;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Maps;
+import com.mengcraft.simpleorm.annotation.Index;
 import com.mengcraft.simpleorm.driver.IDatabaseDriver;
+import com.mengcraft.simpleorm.lib.Utils;
 import com.zaxxer.hikari.HikariDataSource;
 import lombok.EqualsAndHashCode;
 import lombok.NonNull;
@@ -20,6 +23,7 @@ import org.bukkit.plugin.PluginDescriptionFile;
 import org.bukkit.plugin.java.JavaPlugin;
 
 import javax.persistence.Entity;
+import javax.sql.DataSource;
 import java.net.URL;
 import java.net.URLClassLoader;
 import java.sql.Connection;
@@ -36,12 +40,12 @@ import static com.mengcraft.simpleorm.lib.Reflector.invoke;
 @EqualsAndHashCode(of = "id")
 public class EbeanHandler {
 
-    private final Set<Class> mapping = new HashSet<>();
+    private final Set<Class<?>> mapping = new HashSet<>();
     private final JavaPlugin plugin;
     private final boolean managed;
     private final UUID id = UUID.randomUUID();
 
-    private HikariDataSource pool;
+    private DataSource dataSource;
     private Map<String, String> properties;
     private String heartbeat;
     private String name;
@@ -49,21 +53,23 @@ public class EbeanHandler {
     private String url;
     private String user;
     private String password;
+    private LogLevel loggingLevel = LogLevel.NONE;
 
-    private int coreSize = 1;
-    private int maxSize = Math.min(20, Runtime.getRuntime().availableProcessors() + 1);
+    private int coreSize;
+    private int maxSize = ORM.getMaximumSize();
 
     private IsolationLevel isolationLevel;
     private EbeanServer server;
 
-    EbeanHandler(JavaPlugin plugin, boolean managed) {
+    EbeanHandler(JavaPlugin plugin, boolean managed, DataSource dataSource) {
         name = plugin.getName() + '@' + id;
         this.plugin = plugin;
         this.managed = managed;
+        this.dataSource = dataSource;
     }
 
     public EbeanHandler(JavaPlugin plugin) {
-        this(plugin, false);
+        this(plugin, false, null);
     }
 
     @Override
@@ -79,7 +85,7 @@ public class EbeanHandler {
      */
     public Connection getConnection() throws SQLException {
         validInitialized();
-        return pool.getConnection();
+        return dataSource.getConnection();
     }
 
     /**
@@ -111,7 +117,7 @@ public class EbeanHandler {
         }
         Entity annotation = clz.getAnnotation(Entity.class);
         if (annotation == null) {
-            throw new IllegalArgumentException("Not entity clazz! " + clz);
+            plugin.getLogger().warning(String.format("Exception occurred while register entity class. %s not annotated by @Entity", clz.getName()));
         }
         mapping.add(clz);
     }
@@ -140,11 +146,11 @@ public class EbeanHandler {
      *
      * @param ignore Ignore exception when run create table.
      */
-    public void install(boolean ignore) {
+    public void install(boolean ignore, Runnable postprocessor) {
         validInitialized();
         try {
             for (Class<?> line : mapping) {
-                server.find(line).setMaxRows(1).findUnique();
+                server.find(line).setMaxRows(1).findList();
             }
             plugin.getLogger().info("Tables already exists!");
         } catch (Exception e) {
@@ -153,11 +159,74 @@ public class EbeanHandler {
             DdlGenerator gen = ((SpiEbeanServer) server).getDdlGenerator();
             gen.runScript(ignore, gen.generateCreateDdl());
             plugin.getLogger().info("Create tables done!");
+            for (Class<?> cls : mapping) {
+                indexesGenerator(cls);
+            }
+            if (postprocessor != null) {
+                postprocessor.run();
+                plugin.getLogger().info("Execute postprocessor done!");
+            }
         }
+    }
+
+    private void indexesGenerator(Class<?> cls) {
+        Index[] definitions = cls.getAnnotationsByType(Index.class);
+        if (definitions.length == 0) {
+            return;
+        }
+        String clsName = Utils.translateSqlName(cls).toLowerCase();
+        int count = 0;
+        String createSql = "CREATE %s %s ON %s (%s)";
+        for (Index index : definitions) {
+            String[] columnNames = index.value();
+            if (columnNames.length != 0) {
+                String name = index.name();
+                if (Utils.isNullOrEmpty(name)) {
+                    name = "auto_index" + count++;
+                }
+                String sql = String.format(createSql, index.unique() ? "UNIQUE INDEX" : "INDEX", name, clsName, String.join(", ", columnNames));
+                plugin.getLogger().info("execute indexes sql " + sql);
+                server.createSqlUpdate(sql).execute();
+            }
+        }
+    }
+
+    public void install(boolean ignore) {
+        install(ignore, null);
     }
 
     public void install() {
         install(false);
+    }
+
+    /**
+     * @deprecated Internal only for  {@link DataSourceProvider}
+     */
+    DataSource newDataSource() {
+        HikariDataSource source = new HikariDataSource();
+        source.setPoolName(name);
+        source.setConnectionTimeout(5_000);
+        source.setJdbcUrl(IDatabaseDriver.validAndLoad(url));
+        source.setUsername(user);
+        source.setPassword(password);
+        source.setAutoCommit(false);
+        source.setMinimumIdle(Math.max(1, coreSize));
+        source.setMaximumPoolSize(maxSize);
+        if (!Utils.isNullOrEmpty(driver)) {
+            source.setDriverClassName(driver);
+        }
+        if (!Utils.isNullOrEmpty(heartbeat)) {
+            source.setConnectionTestQuery(heartbeat);
+        }
+        if (isolationLevel != null) {
+            source.setTransactionIsolation("TRANSACTION_" + isolationLevel.name());
+        }
+        if (properties != null) {
+            for (val kv : properties.entrySet()) {
+                source.addDataSourceProperty(kv.getKey(), kv.getValue());
+            }
+        }
+        return source;
     }
 
     public void initialize() throws DatabaseException {
@@ -167,56 +236,25 @@ public class EbeanHandler {
         if (mapping.size() < 1) {
             throw new DatabaseException("Not define entity class!");
         }
-        if (!(pool == null)) {
-            throw new DatabaseException("Already shutdown!");
+
+        PolicyInjector.inject();// Hacked in forge server
+
+        if (dataSource == null) {
+            dataSource = ORM.getDataSourceProvider().getDataSource(this);
         }
-        // Hacked in newest modded server
-        PolicyInjector.inject();
 
-        pool = new HikariDataSource();
-
-        pool.setPoolName(name);
-
-        pool.setConnectionTimeout(10_000);
-        pool.setJdbcUrl(IDatabaseDriver.validAndLoad(url));
-        pool.setUsername(user);
-        pool.setPassword(password);
-
-        pool.setAutoCommit(false);
-        pool.setMinimumIdle(coreSize);
-        pool.setMaximumPoolSize(maxSize);
-
-        val conf = new ServerConfig();
-
-        if (url.startsWith("jdbc:sqlite:")) {
-            // Fix ebean-2.7(at bukkit-1.7.10) compatible
-            pool.setConnectionTestQuery("select 1");
-            pool.setDriverClassName("org.sqlite.JDBC");
-            //
-            pool.setTransactionIsolation("TRANSACTION_SERIALIZABLE");
+        ServerConfig conf = new ServerConfig();
+        conf.setName(name);
+        conf.setDataSource(dataSource);
+        conf.setLoggingLevel(loggingLevel);
+        conf.setLoggingToJavaLogger(true);
+        if (dataSource instanceof HikariDataSource && ((HikariDataSource) dataSource).getJdbcUrl().startsWith("jdbc:sqlite:")) {
             conf.setDatabasePlatform(new SQLitePlatform());
             conf.getDatabasePlatform().getDbDdlSyntax().setIdentity("");
-        } else {
-            if (!(driver == null)) {
-                pool.setDriverClassName(driver);
-            }
-            if (!(heartbeat == null)) {
-                pool.setConnectionTestQuery(heartbeat);
-            }
-            if (!(isolationLevel == null)) {
-                pool.setTransactionIsolation("TRANSACTION_" + isolationLevel.name());
-            }
-
         }
-
-        if (properties != null) {
-            for (val kv : properties.entrySet()) {
-                pool.addDataSourceProperty(kv.getKey(), kv.getValue());
-            }
+        if (plugin.getDataFolder().isDirectory() || plugin.getDataFolder().mkdir()) {
+            conf.setResourceDirectory(plugin.getDataFolder().toString());
         }
-
-        conf.setName(name);
-        conf.setDataSource(pool);
 
         for (Class<?> type : mapping) {
             conf.addClass(type);
@@ -352,6 +390,11 @@ public class EbeanHandler {
         this.heartbeat = heartbeat;
     }
 
+    public DataSource getDataSource() {
+        Preconditions.checkNotNull(dataSource, "dataSource not initialized");
+        return dataSource;
+    }
+
     /**
      * @deprecated not very recommend to call this method manual, it will shutdown automatic while JVM down
      */
@@ -363,7 +406,9 @@ public class EbeanHandler {
             val i = clz.getDeclaredConstructor(DefaultServer.class);
             i.setAccessible(true);
             ((Runnable) i.newInstance(server)).run();
-            pool.close();
+            if (dataSource instanceof HikariDataSource && !((HikariDataSource) dataSource).getPoolName().equals("simple_shared")) {// Never shutdown shared
+                ((HikariDataSource) dataSource).close();
+            }
             if (managed) {
                 EbeanManager.unHandle(this);
             }
@@ -378,6 +423,14 @@ public class EbeanHandler {
 
     public IsolationLevel getIsolationLevel() {
         return this.isolationLevel;
+    }
+
+    public LogLevel getLoggingLevel() {
+        return loggingLevel;
+    }
+
+    public void setLoggingLevel(LogLevel loggingLevel) {
+        this.loggingLevel = loggingLevel;
     }
 
     public static EbeanHandler build(@NonNull JavaPlugin plugin, @NonNull Map<String, String> map) {

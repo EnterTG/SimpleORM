@@ -3,21 +3,14 @@
 
     <groupId>com.mengcraft</groupId>
     <artifactId>simpleorm</artifactId>
-    <version>1.2-SNAPSHOT</version>
+    <version>1.4-SNAPSHOT</version>
 
     <repositories>
         <repository>
-            <id>bukkit-ci</id>
-            <url>http://ci.mengcraft.com:8081/plugin/repository/everything/</url>
+            <id>i7mc_repository</id>
+            <url>http://repository.i7mc.com:8008/</url>
         </repository>
     </repositories>
-
-    <distributionManagement>
-        <snapshotRepository>
-            <id>i7mc</id>
-            <url>http://p.i7mc.com:8082/repository/internal/</url>
-        </snapshotRepository>
-    </distributionManagement>
 
     <dependencies>
         <dependency>
@@ -34,7 +27,7 @@
         <dependency>
             <groupId>com.zaxxer</groupId>
             <artifactId>HikariCP</artifactId>
-            <version>3.2.0</version>
+            <version>3.4.5</version>
         </dependency>
         <dependency>
             <groupId>org.projectlombok</groupId>
@@ -45,7 +38,7 @@
         <dependency>
             <groupId>redis.clients</groupId>
             <artifactId>jedis</artifactId>
-            <version>3.0.1</version>
+            <version>3.3.0</version>
         </dependency>
         <!--<dependency>-->
             <!--<groupId>org.mongodb</groupId>-->
@@ -55,11 +48,12 @@
         <dependency>
             <groupId>org.mongodb</groupId>
             <artifactId>mongo-java-driver</artifactId>
-            <version>2.14.2</version>
+            <version>2.14.3</version>
         </dependency>
     </dependencies>
 
     <build>
+        <defaultGoal>clean install</defaultGoal>
         <plugins>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>

@@ -3,66 +3,45 @@ package com.mengcraft.simpleorm;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.HashMultimap;
 import com.google.common.collect.Multimap;
+import com.mengcraft.simpleorm.lib.Utils;
+import com.mengcraft.simpleorm.provider.IRedisProvider;
 import com.mengcraft.simpleorm.redis.RedisLiveObjectBucket;
 import com.mengcraft.simpleorm.redis.RedisMessageTopic;
 import lombok.Cleanup;
-import lombok.NonNull;
 import lombok.SneakyThrows;
-import org.apache.commons.pool2.impl.GenericObjectPoolConfig;
 import org.json.simple.JSONObject;
 import org.json.simple.JSONValue;
 import redis.clients.jedis.BinaryJedisPubSub;
+import redis.clients.jedis.Client;
 import redis.clients.jedis.Jedis;
-import redis.clients.jedis.JedisPool;
-import redis.clients.jedis.JedisSentinelPool;
 import redis.clients.jedis.exceptions.JedisConnectionException;
 import redis.clients.jedis.params.SetParams;
 
-import java.net.URI;
+import java.io.Closeable;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.util.Collection;
-import java.util.Collections;
-import java.util.HashSet;
 import java.util.Map;
-import java.util.Set;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.Executor;
 import java.util.function.Consumer;
 import java.util.function.Function;
 
 import static com.mengcraft.simpleorm.ORM.nil;
 
-public class RedisWrapper {
+public class RedisWrapper implements Closeable {
 
-    private final JedisResources resources;
-    private MessageFilter messageFilter;
+    private final IRedisProvider resources;
+    private MessageFilter filter;
 
-    private RedisWrapper(JedisPool pool) {
-        resources = pool::getResource;
+    public RedisWrapper(IRedisProvider resources) {
+        this.resources = resources;
     }
 
-    private RedisWrapper(JedisSentinelPool sentinels) {
-        resources = sentinels::getResource;
-    }
-
-    public static RedisWrapper b(String sentinel, String url, int conn) {
-        GenericObjectPoolConfig config = new GenericObjectPoolConfig();
-        if (conn >= 1) {
-            config.setMaxTotal(conn);
-        }
-        if (sentinel == null || sentinel.isEmpty()) {
-            return new RedisWrapper(new JedisPool(config, URI.create(url)));
-        }
-        Set<String> sentinels = new HashSet<>();
-        if (url.matches("redis://(.+[,].+)")) {
-            Collections.addAll(sentinels, url.substring(8).split(","));
-        } else {
-            String[] split = url.split(";");
-            for (String line : split) {
-                URI uri = URI.create(line);
-                sentinels.add(uri.getHost() + ':' + uri.getPort());
-            }
-        }
-        return new RedisWrapper(new JedisSentinelPool(sentinel, sentinels, config));
+    @Override
+    @SneakyThrows
+    public void close() {
+        resources.close();
     }
 
     public String ping() throws JedisConnectionException {
@@ -120,61 +99,63 @@ public class RedisWrapper {
         }
     }
 
-    public synchronized void subscribe(String channel, Consumer<byte[]> consumer) {
-        if (nil(messageFilter)) {
-            messageFilter = new MessageFilter();
-            new Thread(() -> open(client -> client.subscribe(messageFilter, channel.getBytes(StandardCharsets.UTF_8)))).start();
-        } else if (!messageFilter.handled.containsKey(channel)) {
-            messageFilter.subscribe(channel.getBytes(StandardCharsets.UTF_8));
+    public void subscribe(String channel, Consumer<byte[]> consumer) {
+        subscribe(channel, consumer, command -> new Thread(command).start());
+    }
+
+    public synchronized void subscribe(String channel, Consumer<byte[]> consumer, Executor executor) {
+        if (nil(filter)) {
+            filter = new MessageFilter();
+            Jedis client = resources.getResource();
+            client.subscribe(filter, new byte[0]);// hacked
+            filter.addSubscriber(channel, consumer);
+            executor.execute(() -> {
+                try {
+                    filter.execute();
+                } finally {
+                    client.close();
+                }
+            });
+        } else if (!filter.isSubscribed(channel, consumer)) {
+            filter.addSubscriber(channel, consumer);
         }
-        messageFilter.handled.put(channel, consumer);
     }
 
     public synchronized void unsubscribeAll() {
-        if (nil(messageFilter)) {
+        if (nil(filter)) {
             return;
         }
-        messageFilter.unsubscribe();
-        messageFilter = null;
+        filter.unsubscribe();
+        filter = null;
     }
 
     @SneakyThrows
     public synchronized void unsubscribe(String channel) {
-        if (nil(messageFilter)) {
+        if (nil(filter)) {
             return;
         }
 
-        if (messageFilter.handled.removeAll(channel).isEmpty()) {// no op
+        if (filter.subscribers.removeAll(channel).isEmpty()) {// no op
             return;
         }
 
-        messageFilter.unsubscribe(channel.getBytes(StandardCharsets.UTF_8));
-        if (!messageFilter.handled.isEmpty()) {
+        filter.unsubscribe(channel.getBytes(StandardCharsets.UTF_8));
+        if (!filter.subscribers.isEmpty()) {
             return;
         }
 
-        messageFilter = null;
+        filter = null;
     }
 
     public synchronized void unsubscribe(String channel, Consumer<byte[]> consumer) {
-        if (nil(messageFilter)) {
+        if (nil(filter)) {
             return;
         }
 
-        if (!messageFilter.handled.remove(channel, consumer)) {// no op
-            return;
+        int subscribers = filter.removeSubscriber(channel, consumer);
+        if (subscribers == 0) {
+            filter = null;
         }
-
-        if (messageFilter.handled.containsKey(channel)) {// if still handled any
-            return;
-        }
-
-        messageFilter.unsubscribe(channel.getBytes(StandardCharsets.UTF_8));
-        if (!messageFilter.handled.isEmpty()) {
-            return;
-        }
-
-        messageFilter = null;
     }
 
     public void set(String key, Object obj) {
@@ -218,18 +199,29 @@ public class RedisWrapper {
         return new RedisLiveObjectBucket(this, bucket);
     }
 
-    private interface JedisResources {
-
-        Jedis getResource();
-    }
-
     private static class MessageFilter extends BinaryJedisPubSub {
 
-        private final Multimap<String, Consumer<byte[]>> handled = HashMultimap.create();
+        private static final Method METHOD_process = Utils.getAccessibleMethod(BinaryJedisPubSub.class, "process", Client.class);
+        private static final Field FIELD_client = Utils.getAccessibleField(BinaryJedisPubSub.class, "client");
 
-        @SneakyThrows
+        private final Multimap<String, Consumer<byte[]>> subscribers = HashMultimap.create();
+
+        void addSubscriber(String channel, Consumer<byte[]> consumer) {
+            if (!subscribers.containsKey(channel)) {
+                subscribe(channel.getBytes(StandardCharsets.UTF_8));
+            }
+            subscribers.put(channel, consumer);
+        }
+
+        int removeSubscriber(String channel, Consumer<byte[]> consumer) {
+            if (subscribers.remove(channel, consumer) && !subscribers.containsKey(channel)) {
+                unsubscribe(channel.getBytes(StandardCharsets.UTF_8));
+            }
+            return subscribers.size();
+        }
+
         public void onMessage(byte[] channel, byte[] message) {
-            Collection<Consumer<byte[]>> allConsumer = handled.get(new String(channel, StandardCharsets.UTF_8));
+            Collection<Consumer<byte[]>> allConsumer = subscribers.get(new String(channel, StandardCharsets.UTF_8));
             if (allConsumer.isEmpty()) {
                 return;
             }
@@ -239,13 +231,23 @@ public class RedisWrapper {
 
         @Override
         @SneakyThrows
-        public void subscribe(@NonNull byte[]... channels) {
+        public void proceed(Client client, byte[]... channels) {
+            FIELD_client.set(this, client);
+        }
+
+        @SneakyThrows
+        void execute() {
+            Client client = (Client) FIELD_client.get(this);
+            client.setTimeoutInfinite();
             try {
-                super.subscribe(channels);
-            } catch (NullPointerException e) {
-                TimeUnit.MILLISECONDS.sleep(0);
-                subscribe(channels);
+                METHOD_process.invoke(this, client);
+            } finally {
+                client.rollbackTimeout();
             }
+        }
+
+        public boolean isSubscribed(String channel, Consumer<byte[]> consumer) {
+            return subscribers.containsEntry(channel, consumer);
         }
     }
 

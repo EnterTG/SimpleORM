@@ -14,7 +14,7 @@ import com.google.gson.JsonParseException;
 import com.google.gson.JsonPrimitive;
 import com.google.gson.JsonSerializationContext;
 import com.google.gson.JsonSerializer;
-import lombok.SneakyThrows;
+import jdk.nashorn.api.scripting.ScriptObjectMirror;
 import org.bukkit.configuration.serialization.ConfigurationSerializable;
 
 import java.lang.reflect.Field;
@@ -28,7 +28,7 @@ import static com.mengcraft.simpleorm.lib.Tuple.tuple;
 
 public class GsonUtils {
 
-    private static final Field PRIMITIVE_VALUE = REFLECT_PRIMITIVE_VALUE();
+    private static final Field PRIMITIVE_VALUE = Utils.getAccessibleField(JsonPrimitive.class, "value");
     private static TypeFunctionRegistry<Object> registry = new TypeFunctionRegistry<>();
 
     static {
@@ -50,13 +50,6 @@ public class GsonUtils {
         });
     }
 
-    @SneakyThrows
-    private static Field REFLECT_PRIMITIVE_VALUE() {
-        Field value = JsonPrimitive.class.getDeclaredField("value");
-        value.setAccessible(true);
-        return value;
-    }
-
     public static Object dump(JsonElement value) {
         return registry.handle(value);
     }
@@ -68,10 +61,22 @@ public class GsonUtils {
     public static Gson createJsonInBuk(FieldNamingPolicy policy) {
         GsonBuilder b = new GsonBuilder();
         b.registerTypeHierarchyAdapter(ConfigurationSerializable.class, new JsonSerializeAdapter());
+        b.registerTypeAdapter(ScriptObjectMirror.class, new ScriptObjectSerializer());
         if (!nil(policy)) {
             b.setFieldNamingPolicy(policy);
         }
         return b.create();
+    }
+
+    public static class ScriptObjectSerializer implements JsonSerializer<ScriptObjectMirror> {
+
+        @Override
+        public JsonElement serialize(ScriptObjectMirror obj, Type t, JsonSerializationContext ctx) {
+            if (obj.isArray()) {
+                return ctx.serialize(obj.values());
+            }
+            return ctx.serialize(obj, Map.class);
+        }
     }
 
     public static class JsonSerializeAdapter implements JsonSerializer<ConfigurationSerializable>, JsonDeserializer<ConfigurationSerializable> {

@@ -1,36 +1,46 @@
 package com.mengcraft.simpleorm;
 
-import com.avaje.ebean.EbeanServer;
+import com.google.common.base.Preconditions;
 import com.google.gson.Gson;
 import com.mengcraft.simpleorm.lib.GsonUtils;
 import com.mengcraft.simpleorm.lib.LibraryLoader;
 import com.mengcraft.simpleorm.lib.MavenLibrary;
 import com.mengcraft.simpleorm.lib.Reflector;
+import com.mengcraft.simpleorm.provider.IDataSourceProvider;
+import com.mengcraft.simpleorm.provider.IRedisProvider;
+import com.mengcraft.simpleorm.redis.RedisProviders;
+import com.zaxxer.hikari.HikariDataSource;
+import lombok.NonNull;
 import lombok.SneakyThrows;
 import lombok.val;
 import org.bukkit.Bukkit;
+import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.configuration.serialization.ConfigurationSerializable;
 import org.bukkit.entity.Player;
 import org.bukkit.metadata.FixedMetadataValue;
-import org.bukkit.plugin.Plugin;
 import org.bukkit.plugin.ServicePriority;
 import org.bukkit.plugin.java.JavaPlugin;
 
-import javax.persistence.Entity;
-import java.util.function.Supplier;
+import javax.sql.DataSource;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
+import java.util.function.Supplier;
 
 import static com.mengcraft.simpleorm.lib.Tuple.tuple;
 
 public class ORM extends JavaPlugin {
 
+    public static final String PLAYER_METADATA_KEY = "ORM_METADATA";
+    private static final int MAXIMUM_SIZE = Math.min(20, Runtime.getRuntime().availableProcessors() + 1);
     private static final GenericTrigger GENERIC_TRIGGER = new GenericTrigger();
     private static final ThreadLocal<Gson> JSON_LAZY = ThreadLocal.withInitial(GsonUtils::createJsonInBuk);
-    private static EbeanHandler globalHandler;
     private static RedisWrapper globalRedisWrapper;
     private static MongoWrapper globalMongoWrapper;
+    private static DataSource sharedDs;
     private static ORM plugin;
+    private static IDataSourceProvider dataSourceProvider = new DataSourceProvider();
+    private static IRedisProvider redisProvider;
 
     @Override
     public void onLoad() {
@@ -46,8 +56,6 @@ public class ORM extends JavaPlugin {
                 EbeanManager.DEFAULT,
                 this,
                 ServicePriority.Normal);
-
-        setEnabled(true);
     }
 
     public static void loadLibrary(JavaPlugin plugin) {
@@ -63,23 +71,21 @@ public class ORM extends JavaPlugin {
     }
 
     private static void loadExtLibrary(JavaPlugin plugin) {
-        LibraryLoader.load(plugin, MavenLibrary.of("org.avaje:ebean:2.8.1"));
+        LibraryLoader.load(plugin, MavenLibrary.of("org.avaje:ebean:2.8.1"), true);
     }
 
     @Override
     @SneakyThrows
     public void onEnable() {
         new MetricsLite(this);
-        if (!nil(globalHandler)) {
-            globalHandler.initialize();
-            globalHandler.install(true);
-        }
         if (nil(globalRedisWrapper)) {
-            String redisUrl = getConfig().getString("redis.url", "");
-            if (!redisUrl.isEmpty()) {
-                int max = getConfig().getInt("redis.max_conn", -1);
-                globalRedisWrapper = RedisWrapper.b(getConfig().getString("redis.master_name"), redisUrl, max);
+            if (redisProvider == null) {
+                FileConfiguration config = getConfig();
+                String redisUrl = config.getString("redis.url", "");
+                int max = config.getInt("redis.max_conn", -1);
+                redisProvider = RedisProviders.of(config.getString("redis.master_name"), redisUrl, max, config.getString("redis.password"));
             }
+            globalRedisWrapper = new RedisWrapper(redisProvider);
         }
         if (nil(globalMongoWrapper)) {
             String url = getConfig().getString("mongo.url", "");
@@ -87,43 +93,20 @@ public class ORM extends JavaPlugin {
                 globalMongoWrapper = MongoWrapper.b(url);
             }
         }
+        getServer().getPluginManager().registerEvents(new Listeners(this), this);
         getLogger().info("Welcome!");
+    }
+
+    public static boolean nil(Object any) {
+        return any == null;
+    }
+
+    public static int getMaximumSize() {
+        return MAXIMUM_SIZE;
     }
 
     public static boolean isFullyEnabled() {
         return plugin.isEnabled();
-    }
-
-    /**
-     * Plz call this method in {@link Plugin#onLoad()}.
-     *
-     * @param input the entity bean class
-     */
-    public static synchronized void global(Class<?> input) {
-        ORM plugin = JavaPlugin.getPlugin(ORM.class);
-        if (plugin.isEnabled()) {
-            throw new IllegalStateException("isEnabled");
-        }
-
-        Entity annotation = input.getAnnotation(Entity.class);
-        if (annotation == null) {
-            throw new IllegalStateException(input + " is not @Entity");
-        }
-
-        if (globalHandler == null) {
-            globalHandler = EbeanManager.DEFAULT.getHandler(plugin);
-        }
-
-        globalHandler.define(input);
-    }
-
-    /**
-     * Plz call this method in or after {@link Plugin#onEnable()}.
-     *
-     * @return the global server
-     */
-    public static EbeanServer globalDataServer() {
-        return globalHandler.getServer();// fast fail
     }
 
     public static RedisWrapper globalRedisWrapper() {
@@ -135,19 +118,50 @@ public class ORM extends JavaPlugin {
     }
 
     public static EbeanHandler getDataHandler(JavaPlugin plugin) {
-        return EbeanManager.DEFAULT.getHandler(plugin);
+        return getDataHandler(plugin, false);
+    }
+
+    public static EbeanHandler getDataHandler(JavaPlugin plugin, boolean shared) {
+        return EbeanManager.DEFAULT.getHandler(plugin, shared);
     }
 
     public static GenericTrigger getGenericTrigger() {
         return GENERIC_TRIGGER;
     }
 
-    public static boolean nil(Object any) {
-        return any == null;
+    /**
+     * @deprecated It's maybe not always HikariDataSource because of the opened setSharedDs function.
+     */
+    public static HikariDataSource getSharedSource() {
+        return (HikariDataSource) getSharedDs();
     }
 
-    public static Gson json() {
-        return JSON_LAZY.get();
+    public static DataSource getSharedDs() {// SharedDs
+        if (sharedDs == null) {
+            synchronized (ORM.class) {
+                if (sharedDs == null) {
+                    sharedDs = newSource();
+                }
+            }
+        }
+        return sharedDs;
+    }
+
+    public static void setSharedDs(@NonNull DataSource sharedDs) {
+        Preconditions.checkState(Bukkit.isPrimaryThread(), "async set shared data-source");
+        ORM.sharedDs = sharedDs;
+    }
+
+    private static DataSource newSource() {
+        HikariDataSource ds = new HikariDataSource();
+        ds.setPoolName("simple_shared");
+        ds.setJdbcUrl(plugin.getConfig().getString("dataSource.url"));
+        ds.setUsername(plugin.getConfig().getString("dataSource.user"));
+        ds.setPassword(plugin.getConfig().getString("dataSource.password"));
+//        ds.setAutoCommit(false);
+        ds.setMinimumIdle(1);
+        ds.setMaximumPoolSize(getMaximumSize());
+        return ds;
     }
 
     public static Map<String, Object> serialize(Object any) {
@@ -155,6 +169,10 @@ public class ORM extends JavaPlugin {
             return ((ConfigurationSerializable) any).serialize();
         }
         return (Map<String, Object>) GsonUtils.dump(json().toJsonTree(any));
+    }
+
+    public static Gson json() {
+        return JSON_LAZY.get();
     }
 
     public static <T> T deserialize(Class<T> clz, Map<String, Object> map) {
@@ -169,16 +187,68 @@ public class ORM extends JavaPlugin {
         return json.fromJson(json.toJsonTree(map), clz);
     }
 
-    public static <T> T attr(Player player, String key, Supplier<T> defaultValue) {
-        if (player.hasMetadata(key)) {
-            return (T) player.getMetadata(key).get(0).value();
+    public static <T> T attr(Player player, @NonNull String key) {
+        Preconditions.checkState(player.isOnline(), "player not online");
+        if (player.hasMetadata(PLAYER_METADATA_KEY)) {
+            Map<String, Object> metadata = (Map<String, Object>) player.getMetadata(PLAYER_METADATA_KEY).get(0).value();
+            return (T) metadata.get(key);
         }
-        if (defaultValue == null) {
-            return null;
+        return null;
+    }
+
+    public static <T> void attr(Player player, @NonNull String key, T value) {
+        Preconditions.checkState(player.isOnline(), "player not online");
+        Preconditions.checkState(Bukkit.isPrimaryThread(), "cannot modify player attributes async");
+        if (player.hasMetadata(PLAYER_METADATA_KEY)) {
+            Map<String, Object> metadata = (Map<String, Object>) player.getMetadata(PLAYER_METADATA_KEY).get(0).value();
+            if (value == null) {
+                metadata.remove(key);
+            } else {
+                metadata.put(key, value);
+            }
         } else {
+            if (value == null) {
+                return;
+            }
+            Map<String, Object> metadata = new HashMap<>();
+            player.setMetadata(PLAYER_METADATA_KEY, new FixedMetadataValue(plugin, metadata));
+            metadata.put(key, value);
+        }
+    }
+
+    @Deprecated
+    public static <T> T attr(Player player, @NonNull String key, @NonNull Supplier<T> defaultValue) {
+        Preconditions.checkState(player.isOnline(), "player not online");
+        if (player.hasMetadata(PLAYER_METADATA_KEY)) {
+            Map<String, Object> metadata = (Map<String, Object>) player.getMetadata(PLAYER_METADATA_KEY).get(0).value();
+            if (metadata.containsKey(key)) {
+                return (T) metadata.get(key);
+            }
+            Preconditions.checkState(Bukkit.isPrimaryThread(), "cannot modify player attributes async");
             T value = Objects.requireNonNull(defaultValue.get());
-            player.setMetadata(key, new FixedMetadataValue(plugin, value));
+            metadata.put(key, value);
+            return value;
+        } else {
+            Preconditions.checkState(Bukkit.isPrimaryThread(), "cannot modify player attributes async");
+            T value = Objects.requireNonNull(defaultValue.get());
+            Map<String, Object> metadata = new HashMap<>();
+            player.setMetadata(PLAYER_METADATA_KEY, new FixedMetadataValue(plugin, metadata));
+            metadata.put(key, value);
             return value;
         }
+    }
+
+    public static IDataSourceProvider getDataSourceProvider() {
+        return dataSourceProvider;
+    }
+
+    public static void setDataSourceProvider(IDataSourceProvider dataSourceProvider) {
+        Preconditions.checkState(!isFullyEnabled(), "Cannot be set after ORM enabled");
+        ORM.dataSourceProvider = dataSourceProvider;
+    }
+
+    public static void setRedisProvider(IRedisProvider redisProvider) {
+        Preconditions.checkState(!isFullyEnabled(), "Cannot be set after ORM enabled");
+        ORM.redisProvider = redisProvider;
     }
 }
